@@ -3,6 +3,9 @@ using DSharpPlus.CommandsNext;
 using DSharpPlus.CommandsNext.Attributes;
 using DSharpPlus.Entities;
 using DSharpPlus.Lavalink;
+using DSharpPlus.Lavalink.EventArgs;
+using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 
@@ -10,6 +13,8 @@ namespace discord_bot.Commands
 {
     public class MusicCommands : BaseCommandModule
     {
+        private readonly Dictionary<ulong, Queue<LavalinkTrack>> _musicQueues = new Dictionary<ulong, Queue<LavalinkTrack>>();
+
         [Command("play")]
         public async Task Join(CommandContext ctx, [RemainingText] string search)
         {
@@ -18,7 +23,7 @@ namespace discord_bot.Commands
 
             if (node == null)
             {
-                // O Lavalink não está conectado, maneje isso conforme necessário
+                await ctx.RespondAsync("Opa, parece que o lavalink está com problemas, o cabaço me programou mal");
             }
             else
             {
@@ -26,76 +31,150 @@ namespace discord_bot.Commands
 
                 if (channel != null)
                 {
-                    var conn1 = await node.ConnectAsync(channel);
-                    // O objeto 'conn' agora contém a conexão com o canal de voz.
+                    var voiceConected = await node.ConnectAsync(channel);
                 }
                 else
                 {
-                    // Membro não está em um canal de voz
-                    await ctx.RespondAsync("Você precisa estar em um canal de voz para usar esse comando.");
+                    await ctx.RespondAsync("Você precisa estar em um canal para o bot saber onde entrar, mas é muito burro mesmo");
+                    return;
                 }
             }
 
-            if (ctx.Member.VoiceState == null || ctx.Member.VoiceState.Channel == null)
-            {
-                await ctx.RespondAsync("You are not in a voice channel.");
-                return;
-            }
-
-            var lava = ctx.Client.GetLavalink();
-            node = lava.ConnectedNodes.Values.First();
+            node = lavalink.ConnectedNodes.Values.First();
             var conn = node.GetGuildConnection(ctx.Member.VoiceState.Guild);
 
             if (conn == null)
             {
-                await ctx.RespondAsync("Lavalink is not connected.");
+                await ctx.RespondAsync("Opa, parece que o lavalink está com problemas, o cabaço me programou mal");
                 return;
             }
 
             var loadResult = await node.Rest.GetTracksAsync(search);
 
-            if (loadResult.LoadResultType == LavalinkLoadResultType.LoadFailed
-                || loadResult.LoadResultType == LavalinkLoadResultType.NoMatches)
+            if (loadResult.LoadResultType == LavalinkLoadResultType.LoadFailed || loadResult.LoadResultType == LavalinkLoadResultType.NoMatches)
             {
-                await ctx.RespondAsync($"Track search failed for {search}.");
+                await ctx.RespondAsync($"Não achei nada pra essa pesquisa {search}.");
                 return;
             }
 
-            var track = loadResult.Tracks.First();
+            var tracks = loadResult.Tracks;
 
-            await conn.PlayAsync(track);
+            if (tracks.Count() == 1)
+            {
+                var track = tracks.First();
 
-            await ctx.RespondAsync($"Now playing {track.Title}!");
+                // Adiciona a música à fila
+                EnqueueTrack(ctx.Member.VoiceState.Guild.Id, track);
+
+                await ctx.RespondAsync($"Adicionado à fila: {track.Title}");
+
+                // Se não estiver tocando nada, comece a tocar
+                if (!IsPlaying(ctx.Member.VoiceState.Guild.Id))
+                {
+                    await PlayNextTrack(ctx, ctx.Member.VoiceState.Guild.Id);
+                }
+            }
+            else if (tracks.Count() > 1)
+            {
+                // Se a pesquisa retornar várias músicas, você pode querer permitir ao usuário escolher uma
+                // ou simplesmente adicionar todas à fila. Neste exemplo, adicionamos todas à fila.
+
+                foreach (var track in tracks)
+                {
+                    EnqueueTrack(ctx.Member.VoiceState.Guild.Id, track);
+                }
+
+                string queueString = string.Join(", ", _musicQueues
+                                                        .Where(pair => pair.Value.Count > 0)
+                                                        .SelectMany(pair => pair.Value)
+                                                        .Select(track => track.Title));
+
+                await ctx.RespondAsync($"Músicas na fila: {queueString}");
+
+                // Se não estiver tocando nada, comece a tocar
+                if (!IsPlaying(ctx.Member.VoiceState.Guild.Id))
+                {
+                    await PlayNextTrack(ctx, ctx.Member.VoiceState.Guild.Id);
+                }
+            }
         }
 
-        [Command("leave")]
-        public async Task Leave(CommandContext ctx, DiscordChannel channel)
+        [Command("skip")]
+        public async Task Skip(CommandContext ctx)
         {
-            var lava = ctx.Client.GetLavalink();
-            if (!lava.ConnectedNodes.Any())
+            var lavalink = ctx.Client.GetLavalink();
+            var node = lavalink.ConnectedNodes.Values.FirstOrDefault();
+
+            if (node == null)
             {
-                await ctx.RespondAsync("The Lavalink connection is not established");
+                // O Lavalink não está conectado, maneje isso conforme necessário
                 return;
             }
 
-            var node = lava.ConnectedNodes.Values.First();
+            var guildId = ctx.Member.VoiceState.Guild;
 
-            if (channel.Type != ChannelType.Voice)
+            if (!_musicQueues.TryGetValue(ctx.Member.VoiceState.Guild.Id, out var queue) || queue.Count == 0)
             {
-                await ctx.RespondAsync("Not a valid voice channel.");
+                await ctx.RespondAsync("Não há músicas na fila para pular.");
                 return;
             }
 
-            var conn = node.GetGuildConnection(channel.Guild);
+            var conn = node.GetGuildConnection(guildId);
 
-            if (conn == null)
-            {
-                await ctx.RespondAsync("Lavalink is not connected.");
-                return;
-            }
+            // Para a música atual
+            await conn.StopAsync();
 
-            await conn.DisconnectAsync();
-            await ctx.RespondAsync($"Left {channel.Name}!");
+            // Pula para a próxima música na fila (se houver)
+            await PlayNextTrack(ctx, ctx.Member.VoiceState.Guild.Id);
+
+            await ctx.RespondAsync("Música pulada com sucesso.");
         }
+
+
+        [Command("stop")]
+        public async Task Stop(CommandContext ctx)
+        {
+            var node = ctx.Client.GetLavalink().ConnectedNodes.Values.First();
+            var conn = node.GetGuildConnection(ctx.Member.VoiceState.Guild);
+            await conn.DisconnectAsync();
+        }
+
+        private void EnqueueTrack(ulong guildId, LavalinkTrack track)
+        {
+            if (!_musicQueues.TryGetValue(guildId, out var queue))
+            {
+                queue = new Queue<LavalinkTrack>();
+                queue.Enqueue(track);
+                _musicQueues.Add(guildId, queue);
+            }
+            else
+                queue.Enqueue(track);
+        }
+
+        private bool IsPlaying(ulong guildId)
+        {
+            return !_musicQueues.TryGetValue(guildId, out var queue) && queue.Count > 0;
+        }
+
+        private async Task PlayNextTrack(CommandContext ctx, ulong guildId)
+        {
+            if (_musicQueues.TryGetValue(guildId, out var queue) && queue.Count > 0)
+            {
+                var nextTrack = queue.Dequeue();
+                var node = ctx.Client.GetLavalink().ConnectedNodes.Values.First();
+                var conn = node.GetGuildConnection(ctx.Member.VoiceState.Guild);
+
+                await conn.PlayAsync(nextTrack);
+
+                await ctx.RespondAsync($"Now playing {nextTrack.Title}!");
+
+                conn.PlaybackFinished += async (sender, args) =>
+                {
+                    // Quando a música termina, toque a próxima da fila (se houver)
+                    await PlayNextTrack(ctx, guildId);
+                };
+            }
+        }
+
     }
 }
